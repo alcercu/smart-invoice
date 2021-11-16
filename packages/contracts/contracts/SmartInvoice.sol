@@ -13,7 +13,8 @@ import "./interfaces/IArbitrable.sol";
 import "./interfaces/IArbitrator.sol";
 import "./interfaces/IWRAPPED.sol";
 
-// splittable digital deal lockers w/ embedded arbitration tailored for guild work
+// splittable digital deal lockers
+// w/ embedded arbitration tailored for guild work
 contract SmartInvoice is
     ISmartInvoice,
     IArbitrable,
@@ -23,9 +24,12 @@ contract SmartInvoice is
 {
     using SafeERC20 for IERC20;
 
-    uint256 public constant NUM_RULING_OPTIONS = 5; // excludes options 0, 1 and 2
-    // Note that Aragon Court treats the possible outcomes as arbitrary numbers, leaving the Arbitrable (us) to define how to understand them.
-    // Some outcomes [0, 1, and 2] are reserved by Aragon Court: "missing", "leaked", and "refused", respectively.
+    uint256 public constant NUM_RULING_OPTIONS = 5;
+    // excludes options 0, 1 and 2
+    // Note that Aragon Court treats the possible outcomes as arbitrary
+    // numbers, leaving the Arbitrable (us) to define how to understand them.
+    // Some outcomes [0, 1, and 2] are reserved by Aragon Court: "missing",
+    // "leaked", and "refused", respectively.
     // Note that Aragon Court emits the LOWEST outcome in the event of a tie.
 
     // solhint-disable-next-line var-name-mixedcase
@@ -35,13 +39,26 @@ contract SmartInvoice is
         [3, 1], // 2 = 75% to client
         [1, 1], // 3 = 50% to client
         [1, 3], // 4 = 25% to client
-        [0, 1] // 5 = 0% to client
+        [0, 1]  // 5 = 0% to client
     ];
 
-    uint256 public constant MAX_TERMINATION_TIME = 63113904; // 2-year limit on locker
+    // 2-year limit on locker
+    uint256 public constant MAX_TERMINATION_TIME = 63113904;
+    uint256 public MULTIPLIER = 10000;
+    uint256 public DIVISOR = 10000;
+
     address public wrappedNativeToken;
 
     enum ADR {INDIVIDUAL, ARBITRATOR}
+    enum PARTY {NONE, CLIENT, PROVIDER}
+
+    struct Round {
+        uint[2] paidFees;
+        PARTY sideFunded;
+        uint feeRewards;
+        mapping(address => uint[3]) contributions;
+        uint8 ruling;
+    }
 
     address public client;
     address public provider;
@@ -52,12 +69,17 @@ contract SmartInvoice is
     uint256 public resolutionRate;
     bytes32 public details;
 
-    uint256[] public amounts; // milestones split into amounts
+    // milestones split into amounts
+    uint256[] public amounts;
     uint256 public total = 0;
-    bool public locked;
-    uint256 public milestone = 0; // current milestone - starts from 0 to amounts.length
+    // current milestone - starts from 0 to amounts.length
+    uint256 public milestone = 0;
     uint256 public released = 0;
+    // The contract will be in the locked state if a dispute arises
+    bool public locked;
     uint256 public disputeId;
+    uint16 public currentRound;
+    mapping(uint => Round) public rounds;
 
     event Register(
         address indexed client,
@@ -81,6 +103,8 @@ contract SmartInvoice is
         uint256 providerAward,
         uint256 ruling
     );
+    event AppealContribution(PARTY _side, address sender, uint contribution);
+    event HasPaidAppealFee(uint disputeId, uint round);
 
     // solhint-disable-next-line no-empty-blocks
     function initLock() external initializer {}
@@ -92,7 +116,7 @@ contract SmartInvoice is
         address _resolver,
         address _token,
         uint256[] calldata _amounts,
-        uint256 _terminationTime, // exact termination date in seconds since epoch
+        uint256 _terminationTime, // termination date in seconds since epoch
         uint256 _resolutionRate,
         bytes32 _details,
         address _wrappedNativeToken
@@ -228,13 +252,14 @@ contract SmartInvoice is
         }
     }
 
-    // client or main (0) provider can lock remainder for resolution during locker period / update request details
+    // client or main (0) provider can lock remainder for resolution during
+    // locker period / update request details
     function lock(bytes32 _details) external payable override nonReentrant {
         require(!locked, "locked");
         uint256 balance = IERC20(token).balanceOf(address(this));
         require(balance > 0, "balance is 0");
         require(block.timestamp < terminationTime, "terminated");
-        require(_msgSender() == client || _msgSender() == provider, "!party");
+        require(_msgSender() == client || _msgSender() == provider, "!PARTY");
 
         if (resolverType == ADR.ARBITRATOR) {
             disputeId = IArbitrator(resolver).createDispute{value: msg.value}(
@@ -247,7 +272,7 @@ contract SmartInvoice is
         emit Lock(_msgSender(), _details);
     }
 
-    function resolve(
+    function resolve (
         uint256 _clientAward,
         uint256 _providerAward,
         bytes32 _details
@@ -259,7 +284,8 @@ contract SmartInvoice is
         require(balance > 0, "balance is 0");
         require(_msgSender() == resolver, "!resolver");
 
-        uint256 resolutionFee = balance / resolutionRate; // calculates dispute resolution fee (div(20) = 5% of remainder)
+        // calculates dispute resolution fee (div(20) = 5% of remainder)
+        uint256 resolutionFee = balance / resolutionRate;
 
         require(
             _clientAward + _providerAward == balance - resolutionFee,
@@ -286,6 +312,97 @@ contract SmartInvoice is
             resolutionFee,
             _details
         );
+    }
+
+    /** @dev Take up to the total amount required to fund a side of an appeal,
+      *     reimburse the rest. Create an appeal if both sides are fully funded.
+      * @param _side Which side is the appeal for, 0 client, 1 provider.
+      */
+    function appeal(uint8 _side) external payable {
+        require(resolverType == ADR.ARBITRATOR, "!arbitrator");
+        require(locked, "!locked");
+        require(_side < 2);
+        (uint appealPeriodStart, uint appealPeriodEnd) = IArbitrator(resolver)
+            .appealPeriod(disputeId);
+        require(
+            block.timestamp >= appealPeriodStart,
+            "Appeal period hasn't started"
+        );
+        require(block.timestamp < appealPeriodEnd, "Appeal period is over");
+        uint appealCost = IArbitrator(resolver).appealCost(
+            disputeId, abi.encodePacked(details)
+        );
+        uint totalCost = appealCost * MULTIPLIER / DIVISOR;
+
+        Round storage round = rounds[currentRound];
+        uint contribution = contribute(
+            round, PARTY(_side), payable(msg.sender), msg.value, totalCost
+        );
+        emit AppealContribution(PARTY(_side), msg.sender, contribution);
+
+        if (round.paidFees[uint(_side)] >= totalCost) {
+            if (round.sideFunded == PARTY.NONE) {
+                round.sideFunded = PARTY(_side);
+           } else {
+                IArbitrator(resolver).appeal{value: appealCost}(
+                    disputeId, abi.encodePacked(details)
+                );
+                currentRound++;
+                round.feeRewards = round.feeRewards - appealCost;
+                round.sideFunded = PARTY.NONE;
+            }
+            emit HasPaidAppealFee(disputeId, currentRound - 1);
+        }
+    }
+
+    /** Make a contribution.
+      * @param _round Round to contribute to.
+      * @param _side Side to contribute to.
+      * @param _contributor Contributor.
+      * @param _amount Amount the contributor is willing to contribute.
+      * @param _totalRequired Amount needed for this side.
+      * @return The amount of fees contributed by the contributor.
+      */
+    function contribute(
+        Round storage _round,
+        PARTY _side,
+        address payable _contributor,
+        uint _amount,
+        uint _totalRequired
+    ) internal returns (uint) {
+        uint contribution;
+        uint remainingETH;
+        (contribution, remainingETH) = calculateContribution(
+            _amount, _totalRequired - _round.paidFees[uint(_side)]
+        );
+
+        _round.contributions[_contributor][uint(_side)] += contribution;
+        _round.paidFees[uint(_side)] += contribution;
+        _round.feeRewards += contribution;
+
+        if (remainingETH != 0)
+            _contributor.send(remainingETH);
+
+        return contribution;
+    }
+
+    /** @dev Return the contribution value and reminder from certain amount
+      *     and required amount.
+      * @param _amount Available amount of ETH for the contribution.
+      * @param _requiredAmount Amount of ETH required.
+      * @return taken Amount of ETH taken from the initial amount.
+      * @return remainder Amount of ETH left after the operation.
+      */
+    function calculateContribution(uint _amount, uint _requiredAmount)
+        internal
+        pure
+        returns(uint taken, uint remainder)
+    {
+        if (_requiredAmount > _amount)
+            return (_amount, 0);
+
+        remainder = _amount - _requiredAmount;
+        return (_requiredAmount, remainder);
     }
 
     function rule(uint256 _disputeId, uint256 _ruling)
@@ -321,6 +438,17 @@ contract SmartInvoice is
 
         emit Rule(resolver, clientAward, providerAward, _ruling);
         emit Ruling(resolver, _disputeId, _ruling);
+    }
+
+    /** @dev Send rewards or reimburse the fees if no dispute was raised.
+      * @param _beneficiary Address that made contributions to a request.
+      * @param _round Round from which to withdraw.
+      */
+    function withdrawFeesAndRewards(
+        address payable _beneficiary, uint _round
+    ) public {
+        require(locked, "!");
+        Round storage round = rounds[_round];
     }
 
     // receive eth transfers
